@@ -644,6 +644,12 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 
 		let ctx = self.ctx.clone();
 		let subscribers = Subscribers::default();
+		let subscribers2 = subscribers.clone();
+
+		std::thread::spawn(move || loop {
+			std::thread::sleep(std::time::Duration::from_secs(60));
+			tracing::info!("subscription{{{subscribe_method_name}={}}}", subscribers2.lock().len());
+		});
 
 		// Unsubscribe
 		{
@@ -739,7 +745,7 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 							Ok(msg) => {
 								// If the subscription was accepted then send a message
 								// to subscription task otherwise rely on the drop impl.
-								if msg.success {
+								if msg.is_success() {
 									let _ = accepted_tx.send(());
 								}
 								Ok(msg)

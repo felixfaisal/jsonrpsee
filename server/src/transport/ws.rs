@@ -72,6 +72,7 @@ pub(crate) struct CallData<'a, L: Logger> {
 // Batch responses must be sent back as a single message so we read the results from each
 // request in the batch and read the results off of a new channel, `rx_batch`, and then send the
 // complete batch response back to the client over `tx`.
+#[inline(never)]
 #[instrument(name = "batch", skip(b), level = "TRACE")]
 pub(crate) async fn process_batch_request<L: Logger>(b: Batch<'_, L>) -> Option<String> {
 	let Batch { data, call, max_len } = b;
@@ -123,6 +124,7 @@ pub(crate) async fn process_batch_request<L: Logger>(b: Batch<'_, L>) -> Option<
 	}
 }
 
+#[inline(never)]
 pub(crate) async fn process_single_request<L: Logger>(
 	data: &[u8],
 	call: CallData<'_, L>,
@@ -137,6 +139,7 @@ pub(crate) async fn process_single_request<L: Logger>(
 	}
 }
 
+#[inline(never)]
 #[instrument(name = "method_call", fields(method = req.method.as_ref()), skip(call, req), level = "TRACE")]
 pub(crate) async fn execute_call_with_tracing<'a, L: Logger>(
 	req: Request<'a>,
@@ -150,6 +153,7 @@ pub(crate) async fn execute_call_with_tracing<'a, L: Logger>(
 ///
 /// Returns `(MethodResponse, None)` on every call that isn't a subscription
 /// Otherwise `(MethodResponse, Some(PendingSubscriptionCallTx)`.
+#[inline(never)]
 pub(crate) async fn execute_call<'a, L: Logger>(req: Request<'a>, call: CallData<'_, L>) -> CallOrSubscription {
 	let CallData {
 		methods,
@@ -220,10 +224,11 @@ pub(crate) async fn execute_call<'a, L: Logger>(req: Request<'a>, call: CallData
 	let r = response.as_response();
 
 	tx_log_from_str(&r.result, max_log_length);
-	logger.on_result(name, r.success, request_start, TransportProtocol::WebSocket);
+	logger.on_result(name, r.success_or_error, request_start, TransportProtocol::WebSocket);
 	response
 }
 
+#[inline(never)]
 pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Receiver, svc: ServiceData<L>) {
 	let ServiceData {
 		methods,
@@ -248,6 +253,7 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 	let sink = MethodSink::new_with_limit(tx, max_response_body_size, max_log_length);
 	let bounded_subscriptions = BoundedSubscriptions::new(max_subscriptions_per_connection);
 	let pending_calls = FuturesUnordered::new();
+	let now = std::time::Instant::now();
 
 	// Spawn another task that sends out the responses on the Websocket.
 	let send_task_handle = tokio::spawn(send_task(rx, sender, ping_interval, conn_rx));
@@ -329,6 +335,7 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 	graceful_shutdown(result, pending_calls, receiver, data, conn_tx, send_task_handle).await;
 
 	logger.on_disconnect(remote_addr, TransportProtocol::WebSocket);
+	tracing::info!("connection{{{}}} closed after {}s", conn_id, now.elapsed().as_secs());
 	drop(conn);
 	drop(stop_handle);
 }
@@ -465,6 +472,7 @@ struct ExecuteCallParams<L: Logger> {
 	logger: L,
 }
 
+#[inline(never)]
 async fn execute_unchecked_call<L: Logger>(params: ExecuteCallParams<L>) {
 	let ExecuteCallParams {
 		batch_requests_config,
