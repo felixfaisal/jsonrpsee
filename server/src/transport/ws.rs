@@ -417,7 +417,9 @@ async fn send_task(
 	}
 
 	// Terminate connection and send close message.
-	let _ = ws_sender.close().await;
+	if tokio::time::timeout(std::time::Duration::from_secs(60 * 5), ws_sender.close()).await.is_err() {
+		tracing::error!("ws close operation took more than 5 minutes; killing connection");
+	}
 	rx.close();
 }
 
