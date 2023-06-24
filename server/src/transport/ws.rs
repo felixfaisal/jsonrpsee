@@ -369,9 +369,22 @@ async fn send_task(
 			// Received message.
 			Either::Left((Some(response), not_ready)) => {
 				// If websocket message send fail then terminate the connection.
-				if let Err(err) = send_message(&mut ws_sender, response).await {
-					tracing::debug!("WS transport error: send failed: {}", err);
-					break;
+
+				match tokio::time::timeout(
+					std::time::Duration::from_secs(60 * 5),
+					send_message(&mut ws_sender, response),
+				)
+				.await
+				{
+					Ok(Ok(())) => (),
+					Err(_) => {
+						tracing::error!("send operation took more than 5 minutes; killing connection");
+						break;
+					}
+					Ok(Err(e)) => {
+						tracing::debug!("WS transport error: send failed: {}", e);
+						break;
+					}
 				}
 
 				rx_item = rx.next();
