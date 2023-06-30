@@ -622,7 +622,7 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 	///     Ok(())
 	/// });
 	/// ```
-	pub fn register_subscription<R, F, Fut>(
+	pub fn register_subscription<R, F>(
 		&mut self,
 		subscribe_method_name: &'static str,
 		notif_method_name: &'static str,
@@ -631,9 +631,9 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 	) -> Result<&mut MethodCallback, Error>
 	where
 		Context: Send + Sync + 'static,
-		F: (Fn(Params<'static>, PendingSubscriptionSink, Arc<Context>) -> Fut) + Send + Sync + Clone + 'static,
-		Fut: Future<Output = R> + Send + 'static,
-		R: IntoSubscriptionCloseResponse + Send,
+		F: (Fn(Params, PendingSubscriptionSink, Arc<Context>) -> R) + Send + Sync + Clone + 'static,
+		//Fut: Future<Output = R> + Send + 'static,
+		R: IntoSubscriptionCloseResponse + Send + 'static,
 	{
 		if subscribe_method_name == unsubscribe_method_name {
 			return Err(Error::SubscriptionNameConflict(subscribe_method_name.into()));
@@ -709,17 +709,15 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 					// definition and not the as same when the subscription call has been completed.
 					//
 					// This runs until the subscription callback has completed.
-					let sub_fut = callback(params.into_owned(), sink, ctx.clone());
+					let res = callback(params, sink, ctx.clone());
 
-					tokio::spawn(async move {
+					let fut = async move {
 						// This will wait for the subscription future to be resolved
-						let response = match futures_util::future::try_join(sub_fut.map(|f| Ok(f)), accepted_rx).await {
-							Ok((r, _)) => r.into_response(),
-							// The accept call failed i.e, the subscription was not accepted.
-							Err(_) => return,
-						};
+						if accepted_rx.await.is_err() {
+							return;
+						}
 
-						match response {
+						match res.into_response() {
 							SubscriptionCloseResponse::Notif(msg) => {
 								let json = sub_message_to_json(msg, SubNotifResultOrError::Result, &sub_id, method);
 								let _ = method_sink.send(json).await;
@@ -730,7 +728,9 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 							}
 							SubscriptionCloseResponse::None => (),
 						}
-					});
+					};
+
+					tokio::spawn(fut);
 
 					let id = id.clone().into_owned();
 
@@ -753,7 +753,6 @@ impl<Context: Send + Sync + 'static> RpcModule<Context> {
 
 		Ok(callback)
 	}
-
 	/// Register an alias for an existing_method. Alias uniqueness is enforced.
 	pub fn register_alias(&mut self, alias: &'static str, existing_method: &'static str) -> Result<(), Error> {
 		self.methods.verify_method_name(alias)?;

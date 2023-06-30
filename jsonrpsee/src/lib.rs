@@ -78,6 +78,7 @@ cfg_client_transport! {
 
 cfg_server! {
 	pub use jsonrpsee_server as server;
+	pub use tokio;
 }
 
 cfg_proc_macros! {
