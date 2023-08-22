@@ -34,6 +34,8 @@ pub(crate) type Receiver = soketto::Receiver<BufReader<BufWriter<Compat<Upgraded
 
 type Notif<'a> = Notification<'a, Option<&'a JsonRawValue>>;
 
+const FIVE_MINUTES: Duration = Duration::from_secs(5 * 60);
+
 pub(crate) async fn send_message(sender: &mut Sender, response: String) -> Result<(), Error> {
 	sender.send_text_owned(response).await?;
 	sender.flush().await.map_err(Into::into)
@@ -268,9 +270,15 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 		// then no new messages will be read from them.
 		//
 		// TCP retransmission mechanism will take of the rest and adjust the window size accordingly.
-		let Some(stop) = wait_until_connection_buffer_has_capacity(&sink, stopped).await else {
-			break Ok(Shutdown::ConnectionClosed);
-		};
+		let stop =
+			match tokio::time::timeout(FIVE_MINUTES, wait_until_connection_buffer_has_capacity(&sink, stopped)).await {
+				Err(_elapsed) => {
+					tracing::error!("Backpressure didn't release a slot in 5 minutes; closing connection");
+					break Ok(Shutdown::ConnectionClosed);
+				}
+				Ok(Some(s)) => s,
+				Ok(None) => break Ok(Shutdown::ConnectionClosed),
+			};
 
 		stopped = stop;
 
@@ -362,10 +370,17 @@ async fn send_task(
 			// Received message.
 			Either::Left((Some(response), not_ready)) => {
 				// If websocket message send fail then terminate the connection.
-				if let Err(err) = send_message(&mut ws_sender, response).await {
-					tracing::debug!("WS transport error: send failed: {}", err);
-					break;
-				}
+				match tokio::time::timeout(FIVE_MINUTES, send_message(&mut ws_sender, response)).await {
+					Ok(Err(err)) => {
+						tracing::debug!("WS transport error: send failed: {}", err);
+						break;
+					}
+					Err(_elapsed) => {
+						tracing::error!("WS transport error: send timeout after 5 minutes");
+						break;
+					}
+					_ => (),
+				};
 
 				rx_item = rx.next();
 				futs = not_ready;
@@ -397,7 +412,10 @@ async fn send_task(
 	}
 
 	// Terminate connection and send close message.
-	let _ = ws_sender.close().await;
+	if tokio::time::timeout(FIVE_MINUTES, ws_sender.close()).await.is_err() {
+		tracing::error!("WS transport: send close timeout after 5 minutes");
+	}
+
 	rx.close();
 }
 
