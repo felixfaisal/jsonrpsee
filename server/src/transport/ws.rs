@@ -315,7 +315,14 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 							current,
 							maximum
 						);
-						if sink.send_error(Id::Null, reject_too_big_request(max_request_body_size)).await.is_err() {
+						if tokio::time::timeout(
+							FIVE_MINUTES,
+							sink.send_error(Id::Null, reject_too_big_request(max_request_body_size)),
+						)
+						.await
+						.is_err()
+						{
+							tracing::error!("send error took longer than 5 minutes");
 							break Ok(Shutdown::ConnectionClosed);
 						}
 
