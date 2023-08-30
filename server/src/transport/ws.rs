@@ -501,6 +501,7 @@ where
 					ping_config.inactive_limit().map_or(false, |duration| last_active.elapsed() > duration);
 
 				if inactive_limit_exceeded {
+					tracing::error!("The remote peer didn't reply to ping; closing connection");
 					break Receive::Err(SokettoError::Closed, s);
 				}
 
