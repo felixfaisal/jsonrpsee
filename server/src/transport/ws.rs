@@ -1,13 +1,14 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::logger::{self, Logger, TransportProtocol};
 use crate::server::{BatchRequestConfig, ServiceData};
+use crate::PingConfig;
 
-use futures_util::future::{self, Either};
+use futures_util::future::{self, Either, Fuse};
 use futures_util::io::{BufReader, BufWriter};
 use futures_util::stream::{FuturesOrdered, FuturesUnordered};
-use futures_util::{Future, StreamExt};
+use futures_util::{Future, FutureExt, StreamExt};
 use hyper::upgrade::Upgraded;
 use jsonrpsee_core::server::helpers::{
 	batch_response_error, prepare_error, BatchResponseBuilder, MethodResponse, MethodSink,
@@ -236,7 +237,7 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 		batch_requests_config,
 		stop_handle,
 		id_provider,
-		ping_interval,
+		ping_config,
 		conn_id,
 		logger,
 		remote_addr,
@@ -252,11 +253,22 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 	let pending_calls = FuturesUnordered::new();
 
 	// Spawn another task that sends out the responses on the Websocket.
-	let send_task_handle = tokio::spawn(send_task(rx, sender, ping_interval, conn_rx));
+	let send_task_handle = tokio::spawn(send_task(rx, sender, ping_config.ping_interval(), conn_rx));
 
 	// Buffer for incoming data.
 	let mut data = Vec::with_capacity(100);
 	let stopped = stop_handle.clone().shutdown();
+
+	let params = Arc::new(ExecuteCallParams {
+		batch_requests_config,
+		conn_id,
+		methods,
+		max_log_length,
+		max_response_body_size,
+		sink: sink.clone(),
+		id_provider,
+		logger: logger.clone(),
+	});
 
 	tokio::pin!(stopped);
 
@@ -282,7 +294,7 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 
 		stopped = stop;
 
-		match try_recv(&mut receiver, &mut data, stopped).await {
+		match try_recv(&mut receiver, &mut data, stopped, ping_config).await {
 			Receive::Shutdown => break Ok(Shutdown::Stopped),
 			Receive::Ok(stop) => {
 				stopped = stop;
@@ -315,20 +327,11 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 			}
 		};
 
-		let params = ExecuteCallParams {
-			batch_requests_config,
-			bounded_subscriptions: bounded_subscriptions.clone(),
-			conn_id,
-			methods: methods.clone(),
-			max_log_length,
-			max_response_body_size,
-			sink: sink.clone(),
-			id_provider: id_provider.clone(),
-			logger: logger.clone(),
-			data: std::mem::take(&mut data),
-		};
-
-		pending_calls.push(tokio::spawn(execute_unchecked_call(params)));
+		pending_calls.push(tokio::spawn(execute_unchecked_call(
+			params.clone(),
+			std::mem::take(&mut data),
+			bounded_subscriptions.clone(),
+		)));
 	};
 
 	// Drive all running methods to completion.
@@ -392,7 +395,8 @@ async fn send_task(
 			}
 
 			// Handle timer intervals.
-			Either::Right((Either::Left((Some(_instant), stop)), next_rx)) => {
+			Either::Right((Either::Left((_instant, _stopped)), next_rx)) => {
+				stop = _stopped;
 				if let Err(err) = send_ping(&mut ws_sender).await {
 					tracing::debug!("WS transport error: send ping failed: {}", err);
 					break;
@@ -401,11 +405,8 @@ async fn send_task(
 				rx_item = next_rx;
 				futs = future::select(ping_interval.next(), stop);
 			}
-
-			Either::Right((Either::Left((None, _)), _)) => unreachable!("IntervalStream never terminates"),
-
-			// Server is stopped.
-			Either::Right((Either::Right(_), _)) => {
+			Either::Right((Either::Right((_stopped, _)), _)) => {
+				// server has stopped
 				break;
 			}
 		}
@@ -442,39 +443,67 @@ where
 }
 
 /// Attempts to read data from WebSocket fails if the server was stopped.
-async fn try_recv<S>(receiver: &mut Receiver, data: &mut Vec<u8>, stopped: S) -> Receive<S>
+async fn try_recv<S>(receiver: &mut Receiver, data: &mut Vec<u8>, mut stopped: S, ping_config: PingConfig) -> Receive<S>
 where
 	S: Future<Output = ()> + Unpin,
 {
-	let receive = async {
-		// Identical loop to `soketto::receive_data` with debug logs for `Pong` frames.
-		loop {
-			match receiver.receive(data).await? {
-				soketto::Incoming::Data(d) => break Ok(d),
-				soketto::Incoming::Pong(_) => tracing::debug!("Received pong"),
-				soketto::Incoming::Closed(_) => {
-					// The closing reason is already logged by `soketto` trace log level.
-					// Return the `Closed` error to avoid logging unnecessary warnings on clean shutdown.
-					break Err(SokettoError::Closed);
-				}
-			}
+	let mut last_active = Instant::now();
+
+	let receive = futures_util::stream::unfold((receiver, data), |(receiver, data)| async {
+		match receiver.receive(data).await {
+			Ok(soketto::Incoming::Data(_)) => None,
+			Ok(soketto::Incoming::Pong(_)) => Some((Ok(()), (receiver, data))),
+			Ok(soketto::Incoming::Closed(_)) => Some((Err(SokettoError::Closed), (receiver, data))),
+			// The closing reason is already logged by `soketto` trace log level.
+			// Return the `Closed` error to avoid logging unnecessary warnings on clean shutdown.
+			Err(e) => Some((Err(e), (receiver, data))),
 		}
-	};
+	});
 
 	tokio::pin!(receive);
 
-	match futures_util::future::select(receive, stopped).await {
-		Either::Left((Ok(_), s)) => Receive::Ok(s),
-		Either::Left((Err(e), s)) => Receive::Err(e, s),
-		Either::Right(_) => Receive::Shutdown,
+	let inactivity_check =
+		Box::pin(ping_config.inactive_limit().map(|d| tokio::time::sleep(d).fuse()).unwrap_or_else(Fuse::terminated));
+	let mut futs = futures_util::future::select(receive.next(), inactivity_check);
+
+	loop {
+		match futures_util::future::select(futs, stopped).await {
+			// The message has been received, we are done
+			Either::Left((Either::Left((None, _)), s)) => break Receive::Ok(s),
+			// Got a pong response, update our "last seen" timestamp.
+			Either::Left((Either::Left((Some(Ok(())), inactive)), s)) => {
+				last_active = Instant::now();
+				stopped = s;
+				futs = futures_util::future::select(receive.next(), inactive);
+			}
+			// Received an error, terminate the connection.
+			Either::Left((Either::Left((Some(Err(e)), _)), s)) => break Receive::Err(e, s),
+			// Max inactivity timeout fired, check if the connection has been idle too long.
+			Either::Left((Either::Right((_instant, rcv)), s)) => {
+				let inactive_limit_exceeded =
+					ping_config.inactive_limit().map_or(false, |duration| last_active.elapsed() > duration);
+
+				if inactive_limit_exceeded {
+					break Receive::Err(SokettoError::Closed, s);
+				}
+
+				stopped = s;
+				// use really large duration instead of Duration::MAX to
+				// solve the panic issue with interval initialization
+				let inactivity_check = Box::pin(
+					ping_config.inactive_limit().map(|d| tokio::time::sleep(d).fuse()).unwrap_or_else(Fuse::terminated),
+				);
+				futs = futures_util::future::select(rcv, inactivity_check);
+			}
+			// Server has been stopped.
+			Either::Right(_) => break Receive::Shutdown,
+		}
 	}
 }
 
 struct ExecuteCallParams<L: Logger> {
 	batch_requests_config: BatchRequestConfig,
-	bounded_subscriptions: BoundedSubscriptions,
 	conn_id: u32,
-	data: Vec<u8>,
 	id_provider: Arc<dyn IdProvider>,
 	methods: Methods,
 	max_response_body_size: u32,
@@ -483,87 +512,66 @@ struct ExecuteCallParams<L: Logger> {
 	logger: L,
 }
 
-async fn execute_unchecked_call<L: Logger>(params: ExecuteCallParams<L>) {
-	let ExecuteCallParams {
-		batch_requests_config,
-		conn_id,
-		data,
-		sink,
-		max_response_body_size,
-		max_log_length,
-		methods,
-		id_provider,
-		bounded_subscriptions,
-		logger,
-	} = params;
-
-	let request_start = logger.on_request(TransportProtocol::WebSocket);
+async fn execute_unchecked_call<L: Logger>(
+	params: Arc<ExecuteCallParams<L>>,
+	data: Vec<u8>,
+	bounded_subscriptions: BoundedSubscriptions,
+) {
+	let request_start = params.logger.on_request(TransportProtocol::WebSocket);
 	let first_non_whitespace = data.iter().enumerate().take(128).find(|(_, byte)| !byte.is_ascii_whitespace());
+
+	let call_data = CallData {
+		bounded_subscriptions,
+		conn_id: params.conn_id as usize,
+		max_response_body_size: params.max_response_body_size,
+		max_log_length: params.max_log_length,
+		methods: &params.methods,
+		sink: &params.sink,
+		id_provider: &*params.id_provider,
+		logger: &params.logger,
+		request_start,
+	};
 
 	match first_non_whitespace {
 		Some((start, b'{')) => {
-			let call_data = CallData {
-				conn_id: conn_id as usize,
-				bounded_subscriptions,
-				max_response_body_size,
-				max_log_length,
-				methods: &methods,
-				sink: &sink,
-				id_provider: &*id_provider,
-				logger: &logger,
-				request_start,
-			};
-
 			if let Some(rp) = process_single_request(&data[start..], call_data).await {
 				match rp {
 					CallOrSubscription::Subscription(r) => {
-						logger.on_response(&r.result, request_start, TransportProtocol::WebSocket);
+						params.logger.on_response(&r.result, request_start, TransportProtocol::WebSocket);
 					}
 
 					CallOrSubscription::Call(r) => {
-						logger.on_response(&r.result, request_start, TransportProtocol::WebSocket);
-						_ = sink.send(r.result).await;
+						params.logger.on_response(&r.result, request_start, TransportProtocol::WebSocket);
+						_ = params.sink.send(r.result).await;
 					}
 				}
 			}
 		}
 		Some((start, b'[')) => {
-			let limit = match batch_requests_config {
+			let limit = match params.batch_requests_config {
 				BatchRequestConfig::Disabled => {
 					let response = MethodResponse::error(
 						Id::Null,
 						ErrorObject::borrowed(BATCHES_NOT_SUPPORTED_CODE, BATCHES_NOT_SUPPORTED_MSG, None),
 					);
-					logger.on_response(&response.result, request_start, TransportProtocol::WebSocket);
-					_ = sink.send(response.result).await;
+					params.logger.on_response(&response.result, request_start, TransportProtocol::WebSocket);
+					_ = params.sink.send(response.result).await;
 					return;
 				}
 				BatchRequestConfig::Limit(limit) => limit as usize,
 				BatchRequestConfig::Unlimited => usize::MAX,
 			};
 
-			let call_data = CallData {
-				conn_id: conn_id as usize,
-				bounded_subscriptions,
-				max_response_body_size,
-				max_log_length,
-				methods: &methods,
-				sink: &sink,
-				id_provider: &*id_provider,
-				logger: &logger,
-				request_start,
-			};
-
 			let response = process_batch_request(Batch { data: &data[start..], call: call_data, max_len: limit }).await;
 
 			if let Some(response) = response {
-				tx_log_from_str(&response, max_log_length);
-				logger.on_response(&response, request_start, TransportProtocol::WebSocket);
-				_ = sink.send(response).await;
+				tx_log_from_str(&response, params.max_log_length);
+				params.logger.on_response(&response, request_start, TransportProtocol::WebSocket);
+				_ = params.sink.send(response).await;
 			}
 		}
 		_ => {
-			_ = sink.send_error(Id::Null, ErrorCode::ParseError.into()).await;
+			_ = params.sink.send_error(Id::Null, ErrorCode::ParseError.into()).await;
 		}
 	};
 }
