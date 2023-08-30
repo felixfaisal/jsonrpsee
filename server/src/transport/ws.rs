@@ -153,6 +153,7 @@ pub(crate) async fn execute_call_with_tracing<'a, L: Logger>(
 ///
 /// Returns `(MethodResponse, None)` on every call that isn't a subscription
 /// Otherwise `(MethodResponse, Some(PendingSubscriptionCallTx)`.
+#[inline(never)]
 pub(crate) async fn execute_call<'a, L: Logger>(req: Request<'a>, call: CallData<'_, L>) -> CallOrSubscription {
 	let CallData {
 		methods,
@@ -227,6 +228,7 @@ pub(crate) async fn execute_call<'a, L: Logger>(req: Request<'a>, call: CallData
 	response
 }
 
+#[inline(never)]
 pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Receiver, svc: ServiceData<L>) {
 	let ServiceData {
 		methods,
@@ -337,7 +339,15 @@ pub(crate) async fn background_task<L: Logger>(sender: Sender, mut receiver: Rec
 	// Drive all running methods to completion.
 	// **NOTE** Do not return early in this function. This `await` needs to run to guarantee
 	// proper drop behaviour.
-	graceful_shutdown(result, pending_calls, receiver, data, conn_tx, send_task_handle).await;
+	if tokio::time::timeout(
+		FIVE_MINUTES,
+		graceful_shutdown(result, pending_calls, receiver, data, conn_tx, send_task_handle),
+	)
+	.await
+	.is_err()
+	{
+		tracing::error!("graceful shutdown took more than 5 minutes");
+	}
 
 	logger.on_disconnect(remote_addr, TransportProtocol::WebSocket);
 	drop(conn);
@@ -512,6 +522,7 @@ struct ExecuteCallParams<L: Logger> {
 	logger: L,
 }
 
+#[inline(never)]
 async fn execute_unchecked_call<L: Logger>(
 	params: Arc<ExecuteCallParams<L>>,
 	data: Vec<u8>,
