@@ -139,7 +139,8 @@ impl WsClientBuilder {
 	/// # Optional
 	///
 	/// This requires the optional `webpki-tls` feature.
-	#[cfg(feature = "webpki-tls")]
+	// #[cfg(feature = "webpki-tls")]
+	// No, it does not
 	pub fn use_webpki_rustls(mut self) -> Self {
 		self.certificate_store = CertificateStore::WebPki;
 		self
