@@ -30,7 +30,7 @@ serde = "1"
 [features]
 native-tls = ["jsonrpsee-client-transport/native-tls"]
 webpki-tls = ["jsonrpsee-client-transport/webpki-tls"]
-default = ["native-tls"]
+default = ["webpki-tls"]
 
 [package.metadata.docs.rs]
 all-features = true
